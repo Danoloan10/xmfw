@@ -1,0 +1,42 @@
+#!/bin/sh
+
+xtratum=/opt/xtratum
+
+config=$xtratum/xmconfig.arm
+target_config=$xtratum/xmconfig
+
+# Fall back to default if the configuration file is missing in the codebase
+if [ ! -f "$config" ]; then
+	config=/usr/share/defaults/config/xmconfig.arm
+fi
+
+# Copy the xmconfig file
+if [ ! -f "$target_config" ]; then
+	cp "$config" "$target_config"
+fi
+
+# List of XtratuM configuration files {xtratum-arm}
+config_list="core/.config core/include/autoconf.h"
+
+case "$1" in
+	"menu")
+		# menuconfig target
+		target=menuconfig ;;
+	"check")
+		# Check if all configuration files are present
+		for file in $config_list; do
+			if [ ! -f $file ]; then
+				exec false
+			fi
+		done
+		exec true
+	*)
+		# Fallback to default target
+		if [ -n "$1" ]; then
+			echo "WARNING: Unrecognized command '$1'" >&2
+			echo " - Falling back to default configuration..." >&2
+		fi
+		target=defconfig ;;
+esac
+
+exec make -C $xtratum $target
