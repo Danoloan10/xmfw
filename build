@@ -1,7 +1,0 @@
-#/bin/sh
-
-if ! config check; then
-	config
-fi
-
-make -C /opt/xtratum

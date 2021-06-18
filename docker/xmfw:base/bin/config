@@ -1,0 +1,100 @@
+#!/bin/sh
+
+xtratum=/opt/xtratum
+
+input="no";
+output="no";
+arch=;
+toolchain="no";
+
+set -e
+
+while getopts iop:a: opt; do
+	case $opt in
+		i) export input="yes" ;;
+		o) export output="yes" ;;
+		p) export toolchain="yes"; toolchain_bin="$OPTARG" ;;
+		a) export arch="$OPTARG" ;;
+		?) exit 1 ;;
+	esac
+done
+
+shift $(($OPTIND - 1))
+
+if [ -z "$arch" ]; then
+	echo "Must provide architecture" >&2
+	exit 1
+fi
+
+config=$xtratum/xmconfig."$arch"
+target_config=$xtratum/xmconfig
+
+# Fall back to default if the configuration file is missing in the codebase
+if [ ! -f "$config" ]; then
+	config=/usr/share/defaults/config/xmconfig."$arch"
+fi
+
+if [ ! -f "$config" ]; then
+	echo "Architecture $arch without configuration file in codebase nor in image defaults. Modify the Docker image to include the architecture configuration" >&2
+	exit 1
+fi
+
+# Copy the xmconfig file
+if [ ! -f "$target_config" ]; then
+	cp "$config" "$target_config"
+fi
+
+if [ "$toolchain" = "yes" ]; then
+	sed -i 's,TARGET_CCPATH=.*$,TARGET_CCPATH='"${toolchain_bin%%/}/"',g' "$target_config"
+fi
+
+# List of XtratuM configuration files: core, bootloader RSW, XAL
+config_list="core/.config user/bootloaders/rsw/.config user/xal/.config"
+
+check_config() {
+	for file in $config_list; do
+		if [ ! -f $file ]; then
+			return 1
+		fi
+	done
+	return 0	
+}
+
+pack_config() {
+	tar -C $xtratum -zcf /opt/config.tar.gz $config_list
+}
+
+unpack_config() {
+	tar -C $xtratum -zxf /opt/config.tar.gz
+}
+
+case "$1" in
+	"menu")
+		# menuconfig target
+		target=menuconfig ;;
+	"check")
+		# Check if all configuration files are present
+		check_config && exec true || exec false
+		;;
+	"export")
+		pack_config
+		;;
+	*)
+		# Fallback to default target
+		if [ -n "$1" ]; then
+			echo "WARNING: Unrecognized command '$1'" >&2
+			echo " - Falling back to default configuration..." >&2
+		fi
+		target=defconfig ;;
+esac
+
+if [ $input = "yes" ]; then
+	unpack_config
+	target=oldconfig
+fi
+
+make -C $xtratum $target
+
+if [ $output = "yes" ]; then
+	pack_config
+fi

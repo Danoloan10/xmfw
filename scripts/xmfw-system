@@ -1,0 +1,238 @@
+#!/bin/bash
+
+set -e
+
+red="\e[0;91m"
+green="\e[0;92m"
+yellow="\e[0;93m"
+bold="\e[1m"
+reset="\e[0m"
+
+verbose=
+system_image=
+system_path=
+system_name=
+system_build=
+
+toolchain=
+
+keep_container="no"
+keep_path="yes"
+
+vlog() {
+	[ "$verbose" == "yes" ] && echo -e " > $1$reset" >&2
+}
+
+error() {
+	echo -e "$red >> $1$reset" >&2
+}
+
+warn() {
+	echo -e "$yellow >> $1$reset" >&2
+}
+
+info() {
+	echo -e "$green >> $1$reset" >&2
+}
+
+cleanup() {
+	vlog "Cleaning up..."
+
+	if [ -n "$system_build" ] && [ "$keep_container" != "yes" ]; then
+		docker rm $system_build
+	fi
+
+	if [ -n "$system_path" ] && [ "$keep_path" != "yes" ]; then
+		rm -rfi "$keep_path"
+	fi
+}
+
+usage() {
+	printf "Usage\n" >&2
+	printf "\txmfw-install [-v] <command> <args>\n\n" >&2
+	printf "COMMANDS\n" >&2
+	printf "\tcreate <image> <path>\n" >&2
+	printf "\tbuild  <path>\n\n" >&2
+}
+
+trap cleanup 0 1 2 3 6 15
+
+ask_toolchain_root() {
+	prompt='Please specify the toolchain path (if not specified use the default, may not work): '
+	read -e -p "$prompt" path >&2
+	echo -n "$path"
+}
+
+ask_toolchain_binaries() {
+	prompt='Please specify where the toolchain binaries are (absolute path or relative to the toolchain): ' 
+	read -e -p "$prompt" path >&2
+	echo -n "$path"
+}
+
+ask_toolchain() {
+	toolchain=$(ask_toolchain_root)
+	toolchain=${toolchain%%/}
+	
+	if [ -z "$toolchain" ]; then
+		return 0
+	fi
+
+	toolchain_bin=$(ask_toolchain_binaries)
+	toolchain_bin=${toolchain_bin%%/}
+
+	case $toolchain_bin in
+		/*) 
+			if [ -z "$(echo "$toolchain_bin" | grep "$toolchain")" ]; then
+				error "Toolchain binaries path $toolchain is not in toolchain path $toolchain!"
+				exit 1
+			fi
+
+			toolchain_bin=$(echo "$toolchain_bin" | sed 's,'"$toolchain"'/,,g')
+
+			;;
+		*)
+			if [ ! -d "$toolchain" ]; then
+				error "Toolchain path $toolchain is not a directory!"
+				exit 1
+			fi
+			if [ ! -d "$toolchain/$toolchain_bin" ]; then
+				error "Toolchain binaries path $toolchain is not a directory!"
+				exit 1
+			fi
+			;;
+	esac
+}
+
+name_from_path() {
+	basename "$(readlink -f "$1")"
+}
+
+check_container() {
+	if [ -z "$(docker ps --all --quiet --filter "name=$system_build")" ]; then
+		return 1;
+	else
+		return 0;
+	fi
+}
+
+create_container() {
+	info $bold"Creating new system build container from $system_image..."
+
+	ask_toolchain
+
+	printf -v cmdline "/opt/xm-install -- -a -d %s -g %s" \
+		/opt/xm \
+		/usr/bin/
+
+	if [ -n "$toolchain" ]; then
+		printf -v cmdline "$cmdline -t %s" /opt/toolchain/$toolchain_bin/
+		toolchain_mount="-v $toolchain:/opt/toolchain"
+	fi
+
+	vlog "command line: $cmdline"
+
+	vlog "Creating intermediate container"
+	docker create --name $system_build \
+		$toolchain_mount \
+		-it $system_image $cmdline || return 1
+
+	vlog "Installing XtratuM"
+	docker start -i $system_build || return 1
+
+	vlog "Creating final container"
+	system_image=$(docker commit $system_build || return 1)
+
+	info "Creating default system in $bold$system_path"
+	docker cp $system_build:/usr/share/defaults/systems/default_sys/ $system_path || return 1
+
+	docker rm $system_build || return 1
+
+	docker create --name $system_build \
+		$toolchain_mount \
+		-v "$(readlink -f "$system_path")":/opt/system \
+		-it $system_image \
+		sh -c "make -C /opt/system 'XAL_PATH=/opt/xm/xal' 'XTRATUM_PATH=/opt/xm/xm' resident_sw" || return 1
+}
+
+create() {
+	keep_container="no"
+	keep_path="no"
+
+	mkdir -p "$(dirname "${system_path%/}")"
+
+	if check_container; then
+		warn "There is already a container named $system_build, recreating..."
+		docker rm $system_build
+	fi
+
+	create_container || return 1
+}
+
+build() {
+
+	if ! check_container; then
+		warn "The container for $bold$system_name$reset$yellow ($system_build) has not been created"
+		warn "Creating..."
+
+		read -p 'Specify the system install image: ' system_image
+
+		create_container
+	fi
+
+	info "Building $bold$system_path$reset$green using $bold$system_build$reset$green"
+	docker start -i $system_build
+}
+
+while getopts v opt; do
+	case $opt in
+		v) verbose="yes" ;;
+		?) usage || exit 1 ;;
+	esac
+done
+shift $(($OPTIND - 1))
+
+cmd="$1"
+shift 1 || true
+
+case "$cmd" in
+	create)
+		system_image="$1"
+		system_path="$2"
+		system_name="$(basename "$system_path")"
+		system_build="xmfw-$system_name-build"
+
+		if [ -e "$system_path" ]; then
+			error "$system_path exists!"
+			error "Please specify a free path"
+			exit 1
+		fi
+
+		if [ -z "$system_image" ] || [ -z ${system_name%%.} ]; then
+			usage
+			exit 1
+		fi
+
+		create || error "Error creating system!"
+		;;
+	build) 
+		system_path="$1"
+		system_name="$(name_from_path "$system_path")"
+		system_build=xmfw-$system_name-build
+
+		if [ ! -d "$system_path" ]; then
+			error "$system_path is not a directory!"
+			error "Please create the system first"
+			exit 1
+		fi
+
+		build || error "Error building system!"
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac
+
+# Success! do not delete anything on cleanup
+keep_path="yes"
+keep_container="yes"

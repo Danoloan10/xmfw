@@ -1,0 +1,18 @@
+#!/bin/sh
+
+if ! config check; then
+	config
+fi
+
+while getopts c opt; do
+	case $opt in
+		c) clean=clean ;;
+		?) echo "Unrecognized option '$opt'" >&2
+	esac
+done
+
+make -C /opt/xtratum $clean
+make -C /opt/xtratum
+make -C /opt/xtratum distro-run
+
+cp /opt/xtratum/*.run /opt/xm-install

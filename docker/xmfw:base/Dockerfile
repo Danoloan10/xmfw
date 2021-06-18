@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install --yes \
 	libxml2-dev \
 	libxml2-utils
 
-COPY build config /bin/
-COPY defaults /usr/share/
+COPY . /
 
-CMD [ "build" ]
+CMD [ "sh" ]
