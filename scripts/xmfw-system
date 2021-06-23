@@ -16,11 +16,13 @@ system_build=
 
 toolchain=
 
-keep_container="no"
+keep_container="yes"
 keep_path="yes"
 
 vlog() {
-	[ "$verbose" == "yes" ] && echo -e " > $1$reset" >&2
+	if [ "$verbose" == "yes" ]; then
+		echo -e " > $1$reset" >&2
+	fi
 }
 
 error() {
@@ -39,7 +41,7 @@ cleanup() {
 	vlog "Cleaning up..."
 
 	if [ -n "$system_build" ] && [ "$keep_container" != "yes" ]; then
-		docker rm $system_build
+		docker rm --force $system_build >/dev/null
 	fi
 
 	if [ -n "$system_path" ] && [ "$keep_path" != "yes" ]; then
@@ -105,14 +107,33 @@ ask_toolchain() {
 
 name_from_path() {
 	basename "$(readlink -f "$1")"
+
 }
 
-check_container() {
-	if [ -z "$(docker ps --all --quiet --filter "name=$system_build")" ]; then
-		return 1;
-	else
+
+check_system_image_name() {
+	image_name="$1"
+
+	# name of the container. must be ``xmfw-system'' or ``xmfw-name-system''
+	# repository and tags are stripped
+	xmfw=${image_name#*/}
+	xmfw=${image_name%:*}
+
+	if [[ "$xmfw" == "xmfw-system" || "$xmfw" =~ "xmfw-*-system" ]] ; then
 		return 0;
+	else
+		error "Image $build_image does not follow the naming convention."
+		error "If you are$bold really$reset$red sure that it is an image valid to use with xmfw, please rename it to the format ${bold}[repo/]xmfw:[x.y.z]-[arch][-name]$reset"
+		return 1;
 	fi
+}
+
+check_image_exists() {
+	[ -n "$(docker image ls --quiet --filter "reference=$1")" ]
+}
+
+check_container_exists() {
+	[ -n "$(docker ps --all --quiet --filter "name=$1")" ]
 }
 
 create_container() {
@@ -134,35 +155,37 @@ create_container() {
 	vlog "Creating intermediate container"
 	docker create --name $system_build \
 		$toolchain_mount \
-		-it $system_image $cmdline || return 1
+		-it $system_image $cmdline >/dev/null || return 1
+
+	keep_container="no"
 
 	vlog "Installing XtratuM"
-	docker start -i $system_build || return 1
+	docker start -i $system_build >/dev/null || return 1
 
 	vlog "Creating final container"
 	system_image=$(docker commit $system_build || return 1)
 
 	info "Creating default system in $bold$system_path"
-	docker cp $system_build:/usr/share/defaults/systems/default_sys/ $system_path || return 1
+	docker cp $system_build:/opt/xm/xal-examples/$template $system_path || return 1
 
-	docker rm $system_build || return 1
+	docker rm $system_build >/dev/null || return 1
 
 	docker create --name $system_build \
 		$toolchain_mount \
 		-v "$(readlink -f "$system_path")":/opt/system \
 		-it $system_image \
-		sh -c "make -C /opt/system 'XAL_PATH=/opt/xm/xal' 'XTRATUM_PATH=/opt/xm/xm' resident_sw" || return 1
+		sh -c "make -C /opt/system 'XAL_PATH=/opt/xm/xal' 'XTRATUM_PATH=/opt/xm/xm' resident_sw" >/dev/null || return 1
 }
 
 create() {
-	keep_container="no"
-	keep_path="no"
+	if [ ! -d "$(dirname "${system_path%/}")" ]; then
+		error "$(dirname "${system_path%/}") is not a directory!"
+		return 1
+	fi
 
-	mkdir -p "$(dirname "${system_path%/}")"
-
-	if check_container; then
+	if check_container_exists $system_build; then
 		warn "There is already a container named $system_build, recreating..."
-		docker rm $system_build
+		docker rm $system_build >/dev/null
 	fi
 
 	create_container || return 1
@@ -170,17 +193,27 @@ create() {
 
 build() {
 
-	if ! check_container; then
+	if ! check_container_exists $system_build; then
 		warn "The container for $bold$system_name$reset$yellow ($system_build) has not been created"
 		warn "Creating..."
 
 		read -p 'Specify the system install image: ' system_image
 
+		if ! check_system_image_name $system_image; then
+			return 1
+		fi
+
 		create_container
 	fi
 
 	info "Building $bold$system_path$reset$green using $bold$system_build$reset$green"
-	docker start -i $system_build
+	docker start -i $system_build >/dev/null
+}
+
+list_templates() {
+	container=$(docker create -it "$system_image" /opt/xm-install --tar tf)
+	docker start -i $container | sed -n 's,./xal-examples/\(.*\)/.*,\1,p' | sort | uniq
+	docker rm $container >/dev/null
 }
 
 while getopts v opt; do
@@ -195,9 +228,23 @@ cmd="$1"
 shift 1 || true
 
 case "$cmd" in
+	templates)
+		system_image="$1"
+		if [ -z "$system_image" ]; then
+			usage
+			exit 1
+		fi
+
+		if ! check_system_image_name $system_image; then
+			exit 2
+		fi
+
+		list_templates
+		;;
 	create)
 		system_image="$1"
 		system_path="$2"
+		template="$3"
 		system_name="$(basename "$system_path")"
 		system_build="xmfw-$system_name-build"
 
@@ -212,7 +259,25 @@ case "$cmd" in
 			exit 1
 		fi
 
-		create || error "Error creating system!"
+		if ! check_system_image_name $system_image; then
+			exit 2
+		fi
+
+		if [ -z "$template" ]; then
+			template_list="$(list_templates)"
+			while true; do
+				warn "You must choose a valid template. These are available:"
+				echo -e "$template_list"
+				read -p 'Template name: ' template || exit 1
+				if [ -z "$template" ] || [ -z "$(echo "$template_list" | grep "$template")" ]; then
+					warn "Template name not valid"
+				else
+					break
+				fi
+			done
+		fi
+
+		create || { error "Error creating system!"; exit 1; }
 		;;
 	build) 
 		system_path="$1"
@@ -225,7 +290,7 @@ case "$cmd" in
 			exit 1
 		fi
 
-		build || error "Error building system!"
+		build || { error "Error building system!"; exit 1; }
 		;;
 	*)
 		usage

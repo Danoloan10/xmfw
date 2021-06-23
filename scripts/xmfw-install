@@ -12,7 +12,9 @@ bold="\e[1m"
 reset="\e[0m"
 
 vlog() {
-	[ "$verbose" == "yes" ] && echo -e " > $1$reset" >&2
+	if [ "$verbose" == "yes" ]; then
+		echo -e " > $1$reset" >&2
+	fi
 }
 
 error() {
@@ -29,6 +31,7 @@ info() {
 
 usage() {
 	printf "Usage: xmfw-install [-mvc] " >&2
+	printf "[-a architecture] " >&2
 	printf "[-i CONFIG_IMPORT_PATH] " >&2
 	printf "[-o CONFIG_EXPORT_PATH] " >&2
 	printf "<xtratum build image> [system base image]\n" >&2
@@ -44,16 +47,18 @@ cleanup() {
 	vlog "Cleaning up..."
 
 	if [ -n "$build_cont" ]; then
-		docker rm $build_cont
+		docker rm --force $build_cont >/dev/null
 	fi
 
 	if [ -n "$system_cont" ]; then
-		docker rm $system_cont
+		docker rm --force $system_cont >/dev/null
 	fi
 
 	if [ -n "$tmpdir" ]; then
-		rm -r $tmpdir
+		rm -rf $tmpdir
 	fi
+
+	return 0
 }
 
 trap cleanup 0 1 2 3 6 15
@@ -113,7 +118,7 @@ ask_toolchain() {
 	case $toolchain_bin in
 		/*) 
 			if [ -z "$(echo "$toolchain_bin" | grep "$toolchain")" ]; then
-				error "Toolchain binaries path $toolchain is not in toolchain path $toolchain!"
+				error "Toolchain binaries path $toolchain_bin is not in toolchain path $toolchain!"
 				exit 1
 			fi
 
@@ -150,11 +155,21 @@ check_image_name() {
 	xmfw=${image_name#*/}
 	xmfw=${xmfw%:*}
 
-	if ! [[ "$xmfw" == "xmfw" ]]; then
-		return 1;
-	else
+	if [[ "$xmfw" == "xmfw" ]]; then
 		return 0;
+	else
+		error "Image $build_image does not follow the naming convention."
+		error "If you are$bold really$reset$red sure that it is an image valid to use with xmfw, please rename it to the format ${bold}[repo/]xmfw:[x.y.z][-arch][-name]$reset"
+		return 1;
 	fi
+}
+
+check_image_exists() {
+	[ -n "$(docker image ls --quiet --filter "reference=$1")" ]
+}
+
+check_container_exists() {
+	[ -n "$(docker ps --all --quiet --filter "name=$1")" ]
 }
 
 # ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
@@ -176,10 +191,6 @@ build() {
 		ask_toolchain
 	fi
 
-
-	# architecture
-	arch=
-
 	# flag activating export
 	expflag=
 
@@ -190,8 +201,15 @@ build() {
 	toolchain_opt=
 
 	# extract arch from conventional name
-	arch=${build_image#*:*-}
-	arch=${arch%%-*}
+	if [ -z "$arch" ]; then
+		arch=${build_image#*:*-}
+		arch=${arch%%-*}
+	fi
+
+	if [ -z "$arch" ]; then
+		error "Could not find target architecture! Please specify it with the ${bold}-a$reset option"
+		return 1
+	fi
 
 	# if the toolchain has not been specified, don't specify it in the
 	# config options so that the container's default toolchain is used
@@ -215,11 +233,11 @@ build() {
 
 	# build confic cli
 	printf -v ccli "config -a %s %s %s %s %s" \
-		$arch \
-		$toolchain_opt \
-		$impflag \
-		$expflag \
-		$menu
+		"$arch" \
+		"$toolchain_opt" \
+		"$impflag" \
+		"$expflag" \
+		"$menu"
 
 	# if config-only, do not call build
 	# TODO does not work on ia32
@@ -279,7 +297,7 @@ install() {
 	# if the system base image is a xtratum build image,
 	# choose conventional name;
 	# else, name the system build image according to its base
-	if check_image_name $system_image; then
+	if check_image_name $system_image 2>/dev/null; then
 		system_image="xmfw-system:${build_image#*:}"
 	else
 		system_image="xmfw-$(echo $system_image | sed 's/:/-/g')-system:${build_image#*:}"
@@ -300,6 +318,8 @@ install() {
 
 	vlog "Creating final image"
 	docker commit $system_cont "$system_image" || return 1
+
+	return 0
 }
 
 # ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
@@ -309,10 +329,11 @@ install() {
 ## Main script flow
 
 # Options
-while getopts mcvi:o: opt; do
+while getopts mcva:i:o: opt; do
 	case $opt in
 		m) menu="menu" ;;
 		v) verbose="yes" ;;
+		a) arch="$OPTARG" ;;
 		i) import_config="$OPTARG" ;;
 		o) export_config="$OPTARG" ;;
 		c) config="yes" ;;
@@ -335,22 +356,43 @@ if [ "$config" == "yes" ]; then
 	fi
 fi
 
+# check config arguments
+if [ -n "$export_config" ] && ! [ -d "$(dirname "$export_config")" ]; then
+	error "Destination directory $(dirname $export_config) does not exist";
+	exit 2
+fi
+
+# check config arguments
+if [ -n "$import_config" ] && ! [ -e "$import_config" ]; then
+	error "File $import_config does not exist";
+	exit 2
+fi
+
 # check that build image argument is present
 if [ -z "$build_image" ]; then
 	usage 
 	exit 2
 fi
 
+# check that build image exists
+if ! check_image_exists "$build_image"; then
+	error "Image $build_image is not present in this computer"
+	warn  "Please pull it first using: ${bold}docker pull $build_image"
+	exit 2
+fi
+
 # check convention on build image
 if ! check_image_name "$build_image"; then
-	error "Image $build_image does not follow the naming convention."
-	error "If you are$bold really$reset$red sure that it is an image valid to use with xmfw, please rename it to the format ${bold}[repo/]xmfw:[x.y.z]-[arch][-name]$reset"
 	exit 2
 fi
 
 # if system image is not specified, use build image
 if [ -z "$system_image" ]; then
 	system_image="$build_image";
+elif ! check_image_exists "$system_image"; then
+	error "Image $system_image is not present in this computer"
+	warn  "Please pull it first using: ${bold}docker pull $system_image"
+	exit 2
 fi
 
 tmpdir=$(mktemp -d)
@@ -360,5 +402,9 @@ build   || { error 'XtratuM could not build! Have you set up your toolchain corr
 if [ "$config" != "yes" ]; then
 	install || { error 'There was an error during instalation!'; exit 1; }
 fi
+
+info "$bold Success!"
+
+exit 0
 
 # ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 

@@ -90,7 +90,9 @@ esac
 
 if [ $input = "yes" ]; then
 	unpack_config
-	target=oldconfig
+	if [ $target = "defconfig" ]; then
+		target=oldconfig
+	fi
 fi
 
 make -C $xtratum $target
